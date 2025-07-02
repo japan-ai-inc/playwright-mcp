@@ -99,6 +99,9 @@ async function handleSSE(server: Server, req: http.IncomingMessage, res: http.Se
         const transport = new ReattachableSSEServerTransport('/sse', res, sessionId);
         session.transport = transport;
 
+        // Reconnect the existing connection with the new transport
+        await session.connection.server.connect(transport);
+
         res.on('close', () => {
           testDebug(`client disconnected from session: ${sessionId}`);
         });
