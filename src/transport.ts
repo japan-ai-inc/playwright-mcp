@@ -20,11 +20,19 @@ import crypto from 'node:crypto';
 
 import debug from 'debug';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+// @ts-ignore - StreamableHTTPServerTransport is not exported in the SDK types
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import type { AddressInfo } from 'node:net';
 import type { Server } from './server.js';
+import type { Connection } from './connection.js';
+
+interface Session {
+  transport: SSEServerTransport;
+  connection: Connection;
+  lastSeen: number;
+}
 
 export async function startStdioTransport(server: Server) {
   await server.createConnection(new StdioServerTransport());
@@ -32,7 +40,25 @@ export async function startStdioTransport(server: Server) {
 
 const testDebug = debug('pw:mcp:test');
 
-async function handleSSE(server: Server, req: http.IncomingMessage, res: http.ServerResponse, url: URL, sessions: Map<string, SSEServerTransport>) {
+// Session locking mechanism
+const sessionLocks = new Map<string, boolean>();
+
+// Custom SSE transport that allows setting a specific session ID
+class ReattachableSSEServerTransport extends SSEServerTransport {
+  constructor(endpoint: string, response: http.ServerResponse, sessionId?: string) {
+    super(endpoint, response);
+    if (sessionId) {
+      // Override the sessionId if provided
+      (this as any)._sessionId = sessionId;
+    }
+  }
+
+  get sessionId(): string {
+    return (this as any)._sessionId || super.sessionId;
+  }
+}
+
+async function handleSSE(server: Server, req: http.IncomingMessage, res: http.ServerResponse, url: URL, sessions: Map<string, Session>) {
   if (req.method === 'POST') {
     const sessionId = url.searchParams.get('sessionId');
     if (!sessionId) {
@@ -40,23 +66,65 @@ async function handleSSE(server: Server, req: http.IncomingMessage, res: http.Se
       return res.end('Missing sessionId');
     }
 
-    const transport = sessions.get(sessionId);
-    if (!transport) {
+    const session = sessions.get(sessionId);
+    if (!session) {
       res.statusCode = 404;
       return res.end('Session not found');
     }
 
-    return await transport.handlePostMessage(req, res);
+    session.lastSeen = Date.now();
+    return await session.transport.handlePostMessage(req, res);
   } else if (req.method === 'GET') {
-    const transport = new SSEServerTransport('/sse', res);
-    sessions.set(transport.sessionId, transport);
-    testDebug(`create SSE session: ${transport.sessionId}`);
+    const sessionId = url.searchParams.get('sessionId');
+
+    if (sessionId && sessions.has(sessionId)) {
+      // Check if session is being reattached
+      if (sessionLocks.get(sessionId)) {
+        res.statusCode = 423; // Locked
+        return res.end('Session is currently being reattached');
+      }
+
+      // Lock the session
+      sessionLocks.set(sessionId, true);
+
+      try {
+        // Reattach to existing session
+        const session = sessions.get(sessionId)!;
+        session.lastSeen = Date.now();
+        testDebug(`reattached SSE session: ${sessionId}`);
+        // eslint-disable-next-line no-console
+        console.log(`Reattached session: ${sessionId}`);
+
+        // Update the transport's response stream with the same session ID
+        const transport = new ReattachableSSEServerTransport('/sse', res, sessionId);
+        session.transport = transport;
+
+        res.on('close', () => {
+          testDebug(`client disconnected from session: ${sessionId}`);
+        });
+      } finally {
+        // Unlock the session
+        sessionLocks.delete(sessionId);
+      }
+      return;
+    }
+
+    // Create new session
+    const transport = new ReattachableSSEServerTransport('/sse', res);
     const connection = await server.createConnection(transport);
+    const session: Session = {
+      transport,
+      connection,
+      lastSeen: Date.now()
+    };
+
+    sessions.set(transport.sessionId, session);
+    testDebug(`create SSE session: ${transport.sessionId}`);
+    // eslint-disable-next-line no-console
+    console.log(`New session: ${transport.sessionId}`);
+
     res.on('close', () => {
-      testDebug(`delete SSE session: ${transport.sessionId}`);
-      sessions.delete(transport.sessionId);
-      // eslint-disable-next-line no-console
-      void connection.close().catch(e => console.error(e));
+      testDebug(`client disconnected from session: ${transport.sessionId}`);
     });
     return;
   }
@@ -80,7 +148,7 @@ async function handleStreamable(server: Server, req: http.IncomingMessage, res: 
   if (req.method === 'POST') {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
-      onsessioninitialized: sessionId => {
+      onsessioninitialized: (sessionId: string) => {
         sessions.set(sessionId, transport);
       }
     });
@@ -111,8 +179,36 @@ export async function startHttpServer(config: { host?: string, port?: number }):
 }
 
 export function startHttpTransport(httpServer: http.Server, mcpServer: Server) {
-  const sseSessions = new Map<string, SSEServerTransport>();
+  const sseSessions = new Map<string, Session>();
   const streamableSessions = new Map<string, StreamableHTTPServerTransport>();
+
+  // Session cleanup mechanism
+  const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+  const CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+  const cleanupSessions = () => {
+    const now = Date.now();
+    for (const [sessionId, session] of sseSessions) {
+      // Skip sessions that are being reattached
+      if (sessionLocks.get(sessionId)) {
+        testDebug(`skipping cleanup for session being reattached: ${sessionId}`);
+        continue;
+      }
+
+      if (now - session.lastSeen > SESSION_TTL) {
+        testDebug(`cleaning up idle session: ${sessionId}`);
+        // eslint-disable-next-line no-console
+        console.log(`Closed idle session: ${sessionId}`);
+        sseSessions.delete(sessionId);
+        sessionLocks.delete(sessionId);
+        // eslint-disable-next-line no-console
+        void session.connection.close().catch(e => console.error(e));
+      }
+    }
+  };
+
+  const cleanupInterval = setInterval(cleanupSessions, CLEANUP_INTERVAL);
+
   httpServer.on('request', async (req, res) => {
     const url = new URL(`http://localhost${req.url}`);
     if (url.pathname.startsWith('/mcp'))
@@ -120,6 +216,11 @@ export function startHttpTransport(httpServer: http.Server, mcpServer: Server) {
     else
       await handleSSE(mcpServer, req, res, url, sseSessions);
   });
+
+  httpServer.on('close', () => {
+    clearInterval(cleanupInterval);
+  });
+
   const url = httpAddressToString(httpServer.address());
   const message = [
     `Listening on ${url}`,
